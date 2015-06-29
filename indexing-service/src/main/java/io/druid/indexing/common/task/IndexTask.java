@@ -26,8 +26,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hashing;
@@ -66,7 +68,9 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -181,26 +185,31 @@ public class IndexTask extends AbstractFixedIntervalTask
     final TaskLock myLock = Iterables.getOnlyElement(getTaskLocks(toolbox));
     final Set<DataSegment> segments = Sets.newHashSet();
 
-    final Set<Interval> validIntervals = Sets.intersection(granularitySpec.bucketIntervals().get(), getDataIntervals());
+    // default shard specs
+    final int numShards = ingestionSchema.getTuningConfig().getNumShards();
+    final List<ShardSpec> defaultShardSpecs;
+    if (numShards > 0) {
+      defaultShardSpecs = Lists.newArrayList();
+      for (int i = 0; i < numShards; i++) {
+        defaultShardSpecs.add(new HashBasedNumberedShardSpec(i, numShards, jsonMapper));
+      }
+    } else {
+      defaultShardSpecs = ImmutableList.<ShardSpec>of(new NoneShardSpec());
+    }
+
+    // pass once the dataset to get available intervals (plus stats)
+    final SortedMap<Interval, List<ShardSpec>> dataIntervals = getDataIntervals(targetPartitionSize, defaultShardSpecs);
+    final Set<Interval> validIntervals = Sets.intersection(
+        granularitySpec.bucketIntervals().or(ImmutableSortedSet.<Interval>of()),
+        dataIntervals.keySet()
+    );
+
     if (validIntervals.isEmpty()) {
       throw new ISE("No valid data intervals found. Check your configs!");
     }
 
     for (final Interval bucket : validIntervals) {
-      final List<ShardSpec> shardSpecs;
-      if (targetPartitionSize > 0) {
-        shardSpecs = determinePartitions(bucket, targetPartitionSize, granularitySpec.getQueryGranularity());
-      } else {
-        int numShards = ingestionSchema.getTuningConfig().getNumShards();
-        if (numShards > 0) {
-          shardSpecs = Lists.newArrayList();
-          for (int i = 0; i < numShards; i++) {
-            shardSpecs.add(new HashBasedNumberedShardSpec(i, numShards, jsonMapper));
-          }
-        } else {
-          shardSpecs = ImmutableList.<ShardSpec>of(new NoneShardSpec());
-        }
-      }
+      final List<ShardSpec> shardSpecs = dataIntervals.get(bucket);
       for (final ShardSpec shardSpec : shardSpecs) {
         final DataSegment segment = generateSegment(
             toolbox,
@@ -216,25 +225,36 @@ public class IndexTask extends AbstractFixedIntervalTask
     return TaskStatus.success(getId());
   }
 
-  private SortedSet<Interval> getDataIntervals() throws IOException
+  private SortedMap<Interval, List<ShardSpec>> getDataIntervalsWithDeterminingPartitions() throws IOException
   {
     final FirehoseFactory firehoseFactory = ingestionSchema.getIOConfig().getFirehoseFactory();
     final GranularitySpec granularitySpec = ingestionSchema.getDataSchema().getGranularitySpec();
+    final int targetPartitionSize = ingestionSchema.getTuningConfig().getTargetPartitionSize();
 
-    SortedSet<Interval> retVal = Sets.newTreeSet(Comparators.intervalsByStartThenEnd());
+    final SortedMap<Interval, List<ShardSpec>> retVal = Maps.newTreeMap(Comparators.intervalsByStartThenEnd());
     int unparsed = 0;
     try (Firehose firehose = firehoseFactory.connect(ingestionSchema.getDataSchema().getParser())) {
+      final SortedMap<Interval, PartitionsDeterminer> intervals = Maps.newTreeMap(Comparators.intervalsByStartThenEnd());
       while (firehose.hasMore()) {
         final InputRow inputRow = firehose.nextRow();
-        DateTime dt = new DateTime(inputRow.getTimestampFromEpoch());
-        Optional<Interval> interval = granularitySpec.bucketInterval(dt);
+        final DateTime dt = new DateTime(inputRow.getTimestampFromEpoch());
+        final Optional<Interval> interval = granularitySpec.bucketInterval(dt);
         if (interval.isPresent()) {
-          retVal.add(interval.get());
+          PartitionsDeterminer determiner = intervals.get(interval.get());
+          if (determiner == null) {
+            determiner = new PartitionsDeterminer(targetPartitionSize, granularitySpec.getQueryGranularity());
+            intervals.put(interval.get(), determiner);
+          }
+          determiner.addInputRow(inputRow);
         } else {
           unparsed++;
         }
       }
+      for (final Map.Entry<Interval, PartitionsDeterminer> entry : intervals.entrySet()) {
+        retVal.put(entry.getKey(), entry.getValue().getShardSpecs());
+      }
     }
+
     if (unparsed > 0) {
       log.warn("Unable to to find a matching interval for [%,d] events", unparsed);
     }
@@ -242,64 +262,103 @@ public class IndexTask extends AbstractFixedIntervalTask
     return retVal;
   }
 
-  private List<ShardSpec> determinePartitions(
-      final Interval interval,
-      final int targetPartitionSize,
-      final QueryGranularity queryGranularity
-  ) throws IOException
-  {
-    log.info("Determining partitions for interval[%s] with targetPartitionSize[%d]", interval, targetPartitionSize);
+  private SortedMap<Interval, List<ShardSpec>> getDataIntervalsWithDefaultShardSpecs(final List<ShardSpec> defaultShardSpecs) throws IOException {
 
     final FirehoseFactory firehoseFactory = ingestionSchema.getIOConfig().getFirehoseFactory();
+    final GranularitySpec granularitySpec = ingestionSchema.getDataSchema().getGranularitySpec();
+    final int targetPartitionSize = ingestionSchema.getTuningConfig().getTargetPartitionSize();
 
-    // The implementation of this determine partitions stuff is less than optimal.  Should be done better.
-    // Use HLL to estimate number of rows
-    HyperLogLogCollector collector = HyperLogLogCollector.makeLatestCollector();
-
-    // Load data
+    final SortedMap<Interval, List<ShardSpec>> retVal = Maps.newTreeMap(Comparators.intervalsByStartThenEnd());
+    int unparsed = 0;
     try (Firehose firehose = firehoseFactory.connect(ingestionSchema.getDataSchema().getParser())) {
+      final SortedSet<Interval> intervals = Sets.newTreeSet(Comparators.intervalsByStartThenEnd());
       while (firehose.hasMore()) {
         final InputRow inputRow = firehose.nextRow();
-        if (interval.contains(inputRow.getTimestampFromEpoch())) {
-          final List<Object> groupKey = Rows.toGroupKey(
-              queryGranularity.truncate(inputRow.getTimestampFromEpoch()),
-              inputRow
-          );
-          collector.add(
-              hashFunction.hashBytes(HadoopDruidIndexerConfig.jsonMapper.writeValueAsBytes(groupKey))
-                          .asBytes()
+        final DateTime dt = new DateTime(inputRow.getTimestampFromEpoch());
+        final Optional<Interval> interval = granularitySpec.bucketInterval(dt);
+        if (interval.isPresent()) {
+          intervals.add(interval.get());
+        } else {
+          unparsed++;
+        }
+      }
+      for(final Interval interval : intervals) {
+        retVal.put(interval, defaultShardSpecs);
+      }
+    }
+
+    if (unparsed > 0) {
+      log.warn("Unable to to find a matching interval for [%,d] events", unparsed);
+    }
+
+    return retVal;
+  }
+  private SortedMap<Interval, List<ShardSpec>> getDataIntervals(final int targetPartitionSize, final List<ShardSpec> defaultShardSpecs) throws IOException
+  {
+    if (targetPartitionSize > 0 ) {
+      return getDataIntervalsWithDeterminingPartitions();
+    } else {
+      return getDataIntervalsWithDefaultShardSpecs(defaultShardSpecs);
+    }
+  }
+
+  private final static class PartitionsDeterminer
+  {
+    private final int targetPartitionSize;
+    private final QueryGranularity queryGranularity;
+    private final HyperLogLogCollector collector;
+
+    private PartitionsDeterminer(final int targetPartitionSize, final QueryGranularity granularity)
+    {
+      this.targetPartitionSize = targetPartitionSize;
+      this.queryGranularity = granularity;
+      // The implementation of this determine partitions stuff is less than optimal.  Should be done better.
+      // Use HLL to estimate number of rows
+      this.collector = HyperLogLogCollector.makeLatestCollector();
+    }
+
+
+    private void addInputRow(final InputRow inputRow) throws IOException
+    {
+      final List<Object> groupKey = Rows.toGroupKey(
+          queryGranularity.truncate(inputRow.getTimestampFromEpoch()),
+          inputRow
+      );
+      collector.add(
+          hashFunction.hashBytes(HadoopDruidIndexerConfig.jsonMapper.writeValueAsBytes(groupKey))
+                      .asBytes()
+      );
+    }
+
+    private List<ShardSpec> getShardSpecs() {
+      final double numRows = collector.estimateCardinality();
+      log.info("Estimated approximately [%,f] rows of data.", numRows);
+
+      int numberOfShards = (int) Math.ceil(numRows / targetPartitionSize);
+      if ((double) numberOfShards > numRows) {
+        numberOfShards = (int) numRows;
+      }
+      log.info("Will require [%,d] shard(s).", numberOfShards);
+
+      // ShardSpecs we will return
+      final List<ShardSpec> shardSpecs = Lists.newArrayList();
+
+      if (numberOfShards == 1) {
+        shardSpecs.add(new NoneShardSpec());
+      } else {
+        for (int i = 0; i < numberOfShards; ++i) {
+          shardSpecs.add(
+              new HashBasedNumberedShardSpec(
+                  i,
+                  numberOfShards,
+                  HadoopDruidIndexerConfig.jsonMapper
+              )
           );
         }
       }
+
+      return shardSpecs;
     }
-
-    final double numRows = collector.estimateCardinality();
-    log.info("Estimated approximately [%,f] rows of data.", numRows);
-
-    int numberOfShards = (int) Math.ceil(numRows / targetPartitionSize);
-    if ((double) numberOfShards > numRows) {
-      numberOfShards = (int) numRows;
-    }
-    log.info("Will require [%,d] shard(s).", numberOfShards);
-
-    // ShardSpecs we will return
-    final List<ShardSpec> shardSpecs = Lists.newArrayList();
-
-    if (numberOfShards == 1) {
-      shardSpecs.add(new NoneShardSpec());
-    } else {
-      for (int i = 0; i < numberOfShards; ++i) {
-        shardSpecs.add(
-            new HashBasedNumberedShardSpec(
-                i,
-                numberOfShards,
-                HadoopDruidIndexerConfig.jsonMapper
-            )
-        );
-      }
-    }
-
-    return shardSpecs;
   }
 
   private DataSegment generateSegment(
